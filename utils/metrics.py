@@ -63,6 +63,9 @@ class Accuracy(Metric):
 
     def update(self, output):
         return
+    
+    def reset(self):
+        return
 
     def compute(self):
         return self.multi_thrs_measure.compute_accuracy()
@@ -74,6 +77,9 @@ class IoU(Metric):
         self.multi_thrs_measure = multi_thrs_measure
 
     def update(self, output):
+        return
+    
+    def reset(self):
         return
 
     def compute(self):
@@ -88,6 +94,9 @@ class F1score(Metric):
     def update(self, output):
         return
 
+    def reset(self):
+        return
+    
     def compute(self):
         return self.multi_thrs_measure.compute_f1()
 
