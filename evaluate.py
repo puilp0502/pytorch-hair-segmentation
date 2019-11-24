@@ -29,6 +29,10 @@ if __name__ == '__main__':
             help='path to save overlay images, default=None and do not save images in this case')
     parser.add_argument('--use_gpu', type=str2bool, default=True,
             help='True if using gpu during inference')
+    parser.add_argument('--visualize', type=str2bool, default=False,
+            help='if set to True, show input image and output probability map')
+    parser.add_argument('--inference', type=str2bool, default=False,
+            help='if set to True, do not calculate accuracy or metric')
 
     args = parser.parse_args()
 
@@ -38,6 +42,10 @@ if __name__ == '__main__':
     network = args.networks.lower()
     save_dir = args.save_dir
     device = 'cuda' if args.use_gpu else 'cpu'
+    visualize = args.visualize
+    if visualize:
+        import matplotlib.pyplot as plt
+    inference = args.inference
 
     assert os.path.exists(ckpt_dir)
     assert os.path.exists(data_dir)
@@ -52,91 +60,146 @@ if __name__ == '__main__':
     net.load_state_dict(state['weight'])
 
     # this is the default setting for train_verbose.py
+    # test_joint_transforms = jnt_trnsf.Compose([
+    #     jnt_trnsf.Safe32Padding()
+    # ])
+    input_size = 224
     test_joint_transforms = jnt_trnsf.Compose([
-        jnt_trnsf.Safe32Padding()
+        jnt_trnsf.Resize(input_size)
     ])
 
     test_image_transforms = std_trnsf.Compose([
-        std_trnsf.ToTensor(),
-        std_trnsf.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        std_trnsf.ToTensor()
         ])
 
     # transforms only on mask
     mask_transforms = std_trnsf.Compose([
         std_trnsf.ToTensor()
         ])
+    if not inference:
+        test_loader = get_loader(dataset=args.dataset,
+                                data_dir=data_dir,
+                                train=False,
+                                joint_transforms=test_joint_transforms,
+                                image_transforms=test_image_transforms,
+                                mask_transforms=mask_transforms,
+                                batch_size=1,
+                                shuffle=False,
+                                num_workers=8)
 
-    test_loader = get_loader(dataset=args.dataset,
-                             data_dir=data_dir,
-                             train=False,
-                             joint_transforms=test_joint_transforms,
-                             image_transforms=test_image_transforms,
-                             mask_transforms=mask_transforms,
-                             batch_size=1,
-                             shuffle=False,
-                             num_workers=4)
+        # prepare measurements
+        metric = MultiThresholdMeasures()
+        metric.reset()
+        durations = list()
 
-    # prepare measurements
-    metric = MultiThresholdMeasures()
-    metric.reset()
-    durations = list()
+        # prepare images
+        imgs = [os.path.join(img_dir, k) for k in sorted(os.listdir(img_dir)) if k.endswith('.jpg')]
+        with torch.no_grad():
+            for i, (data, label) in enumerate(test_loader):
+                print('[{:3d}/{:3d}] processing image... '.format(i+1, len(test_loader)))
+                net.eval()
+                data, label = data.to(device), label.to(device)
+                
+                # inference
+                start = time.time()
+                logit = net(data)
+                duration = time.time() - start
 
-    # prepare images
-    imgs = [os.path.join(img_dir, k) for k in sorted(os.listdir(img_dir)) if k.endswith('.jpg')]
-    with torch.no_grad():
-        for i, (data, label) in enumerate(test_loader):
-            print('[{:3d}/{:3d}] processing image... '.format(i+1, len(test_loader)))
-            net.eval()
-            data, label = data.to(device), label.to(device)
+                # prepare mask
+                data = data.cpu()[0].numpy().transpose(1, 2, 0)
+                pred = logit.cpu()[0].numpy().transpose(1, 2, 0)
+                pred = pred.reshape(pred.shape[0], pred.shape[1])
+                mask = pred >= -0.3
+                mh, mw = pred.shape
+                if visualize:
+                    plt.figure(0)
+                    plt.subplot(1, 2, 1)
+                    plt.imshow(data)
+                    plt.subplot(1, 2, 2)
+                    plt.imshow(pred, cmap='gray')
+                    plt.show()
+                
+                mask_n = np.zeros((mh, mw, 3))
+                mask_n[:,:,0] = 255
+                mask_n[:,:,0] *= mask
 
-            # inference
-            start = time.time()
-            logit = net(data)
-            duration = time.time() - start
+                path = os.path.join(save_dir, "figaro_img_%04d.png" % i)
+                image_n = cv2.imread(imgs[i])
 
-            # prepare mask
-            pred = torch.sigmoid(logit.cpu())[0][0].data.numpy()
-            mh, mw = data.size(2), data.size(3)
-            mask = pred >= 0.5
+                # addWeighted
+                image_n = image_n * 0.5 +  cv2.resize(mask_n, (image_n.shape[1], image_n.shape[0])) * 0.5
 
-            mask_n = np.zeros((mh, mw, 3))
-            mask_n[:,:,0] = 255
-            mask_n[:,:,0] *= mask
+                # log measurements
+                metric.update((logit, label))
+                durations.append(duration)
 
-            path = os.path.join(save_dir, "figaro_img_%04d.png" % i)
-            image_n = cv2.imread(imgs[i])
-
-            # discard padded area
-            ih, iw, _ = image_n.shape
-
-            delta_h = mh - ih
-            delta_w = mw - iw
-
-            top = delta_h // 2
-            bottom = mh - (delta_h - top)
-            left = delta_w // 2
-            right = mw - (delta_w - left)
-
-            mask_n = mask_n[top:bottom, left:right, :]
-
-            # addWeighted
-            image_n = image_n * 0.5 +  mask_n * 0.5
-
-            # log measurements
-            metric.update((logit, label))
-            durations.append(duration)
-
-            # write overlay image
-            cv2.imwrite(path,image_n)
+                # write overlay image
+                cv2.imwrite(path,image_n)
 
 
-    # compute measurements
-    iou = metric.compute_iou()
-    f = metric.compute_f1()
-    acc = metric.compute_accuracy()
-    avg_fps = sum(durations)/len(durations)
+        # compute measurements
+        iou = metric.compute_iou()
+        f = metric.compute_f1()
+        acc = metric.compute_accuracy()
+        avg_fps = len(durations)/sum(durations)
 
-    print('Avg-FPS:', avg_fps)
-    print('Pixel-acc:', acc)
-    print('F1-score:', f)
-    print('IOU:', iou)
+        print('Avg-FPS:', avg_fps)
+        print('Pixel-acc:', acc)
+        print('F1-score:', f)
+        print('IOU:', iou)
+    else:
+        durations = []
+        # prepare images
+        imgs = [os.path.join(data_dir, k) for k in sorted(os.listdir(data_dir)) if k.endswith('.jpg')]
+        img_data = [torch.from_numpy(np.array(Image.open(fname)).transpose(2, 0, 1)[np.newaxis, :, :, :]) for fname in imgs]
+        with torch.no_grad():
+            for i, data in enumerate(img_data):
+                print('[{:3d}/{:3d}] processing image... '.format(i+1, len(imgs)))
+                net.eval()
+                data = data.to(device, dtype=torch.float32) / 255
+                
+                # inference
+                start = time.time()
+                logit = net(data)
+                duration = time.time() - start
+
+                # prepare mask
+                data = data.cpu()[0].numpy().transpose(1, 2, 0)
+                pred = logit.cpu()[0].numpy().transpose(1, 2, 0)
+                pred = pred.reshape(pred.shape[0], pred.shape[1])
+                mask = pred >= -0.3
+                mh, mw = pred.shape
+                
+                
+                mask_n = np.zeros((mh, mw, 3))
+                mask_n[:,:,0] = 255
+                mask_n[:,:,0] *= mask
+
+                mask_r = np.zeros((mh, mw, 3))
+                mask_r[:, :, 0] = np.maximum(pred, 0) * (255/(pred.max()))
+
+                if visualize:
+                    plt.figure(0)
+                    plt.subplot(1, 3, 1)
+                    plt.imshow(data)
+                    plt.subplot(1, 3, 2)
+                    plt.imshow(pred, cmap='gray')
+                    plt.subplot(1, 3, 3)
+                    plt.imshow(mask_r.astype('uint8'))
+                    plt.show()
+
+                path = os.path.join(save_dir, "img_%04d.png" % i)
+                image_n = cv2.imread(imgs[i])
+
+                # addWeighted
+                image_n = image_n * 0.5 +  cv2.resize(mask_r, (image_n.shape[1], image_n.shape[0])) * 0.5
+
+                # log measurements
+                durations.append(duration)
+
+                # write overlay image
+                cv2.imwrite(path,image_n)
+
+
+        # compute measurements
+        avg_fps = len(durations)/sum(durations)

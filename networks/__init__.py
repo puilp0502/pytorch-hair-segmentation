@@ -15,5 +15,5 @@ def get_network(name):
     elif name == 'mobilenet':
         return MobileMattingFCN()
     elif name == 'unet':
-        return UNet(n_channels=3, n_classes=1, bilinear=True)
+        return UNet(n_channels=3, n_classes=1, bilinear=False)
     raise ValueError
